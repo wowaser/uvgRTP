@@ -1640,11 +1640,6 @@ rtp_error_t uvgrtp::rtcp::send_app_packet(const char* name, uint8_t subtype,
 
 void uvgrtp::rtcp::set_session_bandwidth(int kbps)
 {
-    interval_ms_ = 1000*360 / kbps; // the reduced minimum (see section 6.2 in RFC 3550)
-
-    if (interval_ms_ > DEFAULT_RTCP_INTERVAL_MS)
-    {
-        interval_ms_ = DEFAULT_RTCP_INTERVAL_MS;
-    }
-    // TODO: This should follow the algorithm specified in RFC 3550 appendix-A.7
+    // Set this to one second until this is properly implemented
+    interval_ms_ = 1000;
 }
