@@ -1179,7 +1179,8 @@ rtp_error_t uvgrtp::rtcp::handle_receiver_report_packet(uint8_t* buffer, size_t&
 
     if (!frame->header.count)
     {
-        LOG_ERROR("Receiver Report cannot have 0 report blocks!");
+        // Annoying when stream priority is 0
+        //LOG_ERROR("Receiver Report cannot have 0 report blocks!");
         return RTP_INVALID_VALUE;
     }
 
