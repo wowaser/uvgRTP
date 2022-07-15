@@ -1642,5 +1642,5 @@ rtp_error_t uvgrtp::rtcp::send_app_packet(const char* name, uint8_t subtype,
 void uvgrtp::rtcp::set_session_bandwidth(int kbps)
 {
     // Set this to one second until this is properly implemented
-    interval_ms_ = 1000;
+    interval_ms_ = 60;
 }

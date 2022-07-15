@@ -740,7 +740,7 @@ void uvgrtp::formats::h26x::garbage_collect_lost_frames(size_t timout)
         // first find all frames that have been waiting for too long
         for (auto& gc_frame : frames_) {
             if (uvgrtp::clock::hrc::diff_now(gc_frame.second.sframe_time) > timout) {
-                LOG_WARN("Found an old frame that has not been completed");
+                //LOG_WARN("Found an old frame that has not been completed");
                 to_remove.push_back(gc_frame.first);
             }
         }
@@ -752,7 +752,7 @@ void uvgrtp::formats::h26x::garbage_collect_lost_frames(size_t timout)
         }
 
         if (total_cleaned > 0) {
-            LOG_INFO("Garbage collection cleaned %d bytes!", total_cleaned);
+            //LOG_INFO("Garbage collection cleaned %d bytes!", total_cleaned);
         }
 
         last_garbage_collection_ = uvgrtp::clock::hrc::now();
