@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
 
 
 /* TODO: explain these constants */
@@ -51,7 +52,10 @@ uvgrtp::rtcp::rtcp(std::shared_ptr<uvgrtp::rtp> rtp, std::string cname, int flag
     app_hook_f_(nullptr),
     app_hook_u_(nullptr),
     active_(false),
-    interval_ms_(DEFAULT_RTCP_INTERVAL_MS)
+    interval_ms_(DEFAULT_RTCP_INTERVAL_MS),
+    ourItems_(),
+    bye_ssrcs_(false),
+    mtu_size_(MAX_PAYLOAD)
 {
     clock_rate_   = rtp->get_clock_rate();
 
@@ -249,9 +253,17 @@ rtp_error_t uvgrtp::rtcp::set_sdes_items(const std::vector<uvgrtp::frame::rtcp_s
 {
     bool hasCname = false;
 
-    for (auto& item : items)
+    std::set<unsigned int> to_ignore;
+
+    // find invalid items and check if cname is already included
+    for (unsigned int i = 0; i < items.size(); ++i)
     {
-        if (item.type == 1)
+        if (items.at(i).type == 0)
+        {
+            LOG_WARN("Invalid item type 0 found at index %lu, removing item", i);
+            to_ignore.insert(i);
+        }
+        else if (items.at(i).type == 1)
         {
             hasCname = true;
             LOG_DEBUG("Found CName in sdes items, not adding pregenerated");
@@ -265,7 +277,14 @@ rtp_error_t uvgrtp::rtcp::set_sdes_items(const std::vector<uvgrtp::frame::rtcp_s
         ourItems_.push_back(cnameItem_);
     }
 
-    ourItems_.insert(ourItems_.end(), items.begin(), items.end());
+    // add all items expect ones set for us to ignore
+    for (unsigned int i = 0; i < items.size(); ++i)
+    {
+        if (to_ignore.find(i) == to_ignore.end())
+        {
+            ourItems_.push_back(items.at(i));
+        }
+    }
 
     return RTP_OK;
 }
@@ -995,6 +1014,8 @@ rtp_error_t uvgrtp::rtcp::handle_incoming_packet(uint8_t *buffer, size_t size)
         return RTP_INVALID_VALUE;
     }
 
+    LOG_DEBUG("Received an RTCP packet with size: %li", size);
+
     size_t read_ptr = 0;
     size_t remaining_size = size;
 
@@ -1009,8 +1030,9 @@ rtp_error_t uvgrtp::rtcp::handle_incoming_packet(uint8_t *buffer, size_t size)
     // decrypt the whole compound packet
     if (size > RTCP_HEADER_SIZE + SSRC_CSRC_SIZE)
     {
-        sender_ssrc = ntohl(*(uint32_t*)& buffer[read_ptr]);
-        if (srtcp_ && (ret = srtcp_->handle_rtcp_decryption(flags_, sender_ssrc, buffer + read_ptr, size)) != RTP_OK)
+        sender_ssrc = ntohl(*(uint32_t*)& buffer[read_ptr + RTCP_HEADER_SIZE]);
+        if (srtcp_ && (ret = srtcp_->handle_rtcp_decryption(flags_, sender_ssrc, 
+            buffer + RTCP_HEADER_SIZE + SSRC_CSRC_SIZE, size)) != RTP_OK)
         {
             LOG_ERROR("Failed at decryption");
             return ret;
@@ -1037,18 +1059,22 @@ rtp_error_t uvgrtp::rtcp::handle_incoming_packet(uint8_t *buffer, size_t size)
          * We have to substract the size of header, since it was added when reading the header. */
         size_t packet_end = read_ptr - RTCP_HEADER_SIZE + size_of_rtcp_packet;
 
-        if (remaining_size < size_of_rtcp_packet)
-        {
-            LOG_ERROR("Received a partial rtcp packet. Not supported!");
-            return RTP_NOT_SUPPORTED;
-        }
+        LOG_ERROR("Handling packet # %i with size %li and remaining packet amount %li",
+            packets, size_of_rtcp_packet, remaining_size);
 
         if (header.version != 0x2)
         {
-            LOG_ERROR("Invalid header version (%u)", header.version);
+            LOG_ERROR("Packet # %i has invalid header version %u", packets, header.version);
             return RTP_INVALID_VALUE;
         }
 
+        if (remaining_size < size_of_rtcp_packet)
+        {
+            LOG_ERROR("Received a partial RTCP packet, not supported!");
+            return RTP_NOT_SUPPORTED;
+        }
+
+        // TODO: I think we can?
         if (header.padding)
         {
             LOG_ERROR("Cannot handle padded packets!");
@@ -1093,6 +1119,7 @@ rtp_error_t uvgrtp::rtcp::handle_incoming_packet(uint8_t *buffer, size_t size)
 
         if (ret != RTP_OK)
         {
+            LOG_WARN("Error parsing RTCP packet");
             return ret;
         }
 
@@ -1102,8 +1129,13 @@ rtp_error_t uvgrtp::rtcp::handle_incoming_packet(uint8_t *buffer, size_t size)
 
     if (packets > 1)
     {
-        LOG_DEBUG("Received a compound RTCP frame with %i packets", packets);
+        LOG_DEBUG("Received a compound RTCP frame with %i packets and size: %li", packets, size);
     }
+    else
+    {
+        LOG_WARN("Received RTCP packet was not a compound packet!");
+    }
+
     return RTP_OK;
 }
 
@@ -1173,7 +1205,7 @@ rtp_error_t uvgrtp::rtcp::handle_receiver_report_packet(uint8_t* buffer, size_t&
      * Check if that's the case and if so, move the entry from initial_participants_ to participants_ */
     if (!is_participant(frame->ssrc))
     {
-        LOG_WARN("Got a Receiver Report from an unknown participant");
+        LOG_INFO("Got an RR from a previously unknown participant SSRC %lu", frame->ssrc);
         add_participant(frame->ssrc);
     }
 
@@ -1218,7 +1250,7 @@ rtp_error_t uvgrtp::rtcp::handle_sender_report_packet(uint8_t* buffer, size_t& r
     read_ssrc(buffer, read_ptr, frame->ssrc);
     if (!is_participant(frame->ssrc))
     {
-        LOG_INFO("Sender Report received from a new participant");
+        LOG_INFO("Got an SR from a previously unknown participant SSRC %lu", frame->ssrc);
         add_participant(frame->ssrc);
     }
 
@@ -1265,6 +1297,12 @@ rtp_error_t uvgrtp::rtcp::handle_sender_report_packet(uint8_t* buffer, size_t& r
 rtp_error_t uvgrtp::rtcp::handle_sdes_packet(uint8_t* packet, size_t& read_ptr, size_t packet_end,
     uvgrtp::frame::rtcp_header& header, uint32_t sender_ssrc)
 {
+    if (!is_participant(sender_ssrc))
+    {
+        LOG_INFO("Got an SDES packet from a previously unknown participant SSRC %lu", sender_ssrc);
+        add_participant(sender_ssrc);
+    }
+
     auto frame = new uvgrtp::frame::rtcp_sdes_packet;
     frame->header = header;
 
@@ -1277,7 +1315,7 @@ rtp_error_t uvgrtp::rtcp::handle_sdes_packet(uint8_t* packet, size_t& read_ptr, 
         read_ssrc(packet, read_ptr, chunk.ssrc);
 
         // Read chunk items, 2 makes sure we at least get item type and length
-        while (read_ptr + 2 <= packet_end)
+        while (read_ptr + 2 <= packet_end && packet[read_ptr] != 0)
         {
             uvgrtp::frame::rtcp_sdes_item item;
             item.type = packet[read_ptr];
@@ -1294,7 +1332,14 @@ rtp_error_t uvgrtp::rtcp::handle_sdes_packet(uint8_t* packet, size_t& read_ptr, 
 
             chunk.items.push_back(item);
         }
+
+        if (packet[read_ptr] == 0)
+        {
+            read_ptr += (4 - read_ptr % 4);
+        }
+
         frame->chunks.push_back(chunk);
+        
     }
 
     sdes_mutex_.lock();
@@ -1405,6 +1450,7 @@ rtp_error_t uvgrtp::rtcp::send_rtcp_packet_to_participants(uint8_t* frame, size_
 {
     if (!frame)
     {
+        LOG_ERROR("No frame given for sending");
         return RTP_GENERIC_ERROR;
     }
 
@@ -1440,8 +1486,66 @@ rtp_error_t uvgrtp::rtcp::send_rtcp_packet_to_participants(uint8_t* frame, size_
     return ret;
 }
 
+size_t uvgrtp::rtcp::size_of_ready_app_packets() const
+{
+    size_t app_size = 0;
+    for (auto& app_name : app_packets_)
+    {
+        // TODO: Should we also send one per subtype?
+        if (!app_name.second.empty())
+        {
+            app_size += get_app_packet_size(app_name.second.front().payload_len);
+        }
+    }
+
+    return app_size;
+}
+
+size_t uvgrtp::rtcp::size_of_compound_packet(uint16_t reports,
+    bool sr_packet, bool rr_packet, bool sdes_packet, size_t app_size, bool bye_packet) const
+{
+    size_t compound_packet_size = 0;
+
+    if (sr_packet)
+    {  
+        compound_packet_size = get_sr_packet_size(flags_, reports);
+        LOG_DEBUG("Sending SR. Compound packet size: %li", compound_packet_size);
+    }
+    else if (rr_packet)
+    {
+        compound_packet_size = get_rr_packet_size(flags_, reports);
+        LOG_DEBUG("Sending RR. Compound packet size: %li", compound_packet_size);
+    }
+    else
+    {
+        LOG_ERROR("RTCP compound packet must start with either SR or RR");
+        return 0;
+    }
+
+    if (sdes_packet)
+    {
+        compound_packet_size += get_sdes_packet_size(ourItems_);
+        LOG_DEBUG("Sending SDES. Compound packet size: %li", compound_packet_size);
+    }
+
+    if (app_size != 0)
+    {
+        compound_packet_size += app_size;
+        LOG_DEBUG("Sending APP. Compound packet size: %li", compound_packet_size);
+    }
+
+    if (bye_packet)
+    {
+        compound_packet_size += get_bye_packet_size(bye_ssrcs_);
+        LOG_DEBUG("Sending BYE. Compound packet size: %li", compound_packet_size);
+    }
+
+    return compound_packet_size;
+}
+
 rtp_error_t uvgrtp::rtcp::generate_report()
 {
+    std::lock_guard<std::mutex> lock(packet_mutex_);
     rtcp_pkt_sent_count_++;
 
     uint16_t reports = 0;
@@ -1453,18 +1557,23 @@ rtp_error_t uvgrtp::rtcp::generate_report()
         }
     }
 
-    bool add_sdes = false;
+    bool sr_packet = our_role_ == SENDER && our_stats.sent_rtp_packet;
+    bool rr_packet = our_role_ == RECEIVER || our_stats.sent_rtp_packet == 0;
+    bool sdes_packet = true;
+    size_t app_packets_size = size_of_ready_app_packets();
+    bool bye_packet = !bye_ssrcs_.empty();
 
-    size_t compound_packet_size = get_rr_packet_size(flags_, reports);
-
-    if (our_role_ == SENDER && our_stats.sent_rtp_packet)
+    size_t compound_packet_size = size_of_compound_packet(reports, sr_packet, rr_packet, sdes_packet, app_packets_size, bye_packet);
+    
+    if (compound_packet_size == 0)
     {
-        compound_packet_size = get_sr_packet_size(flags_, reports);
+        LOG_WARN("Failed to get compound packet size");
+        return RTP_GENERIC_ERROR;
     }
-
-    if (add_sdes)
+    else if (compound_packet_size > mtu_size_)
     {
-        compound_packet_size += get_sdes_packet_size(ourItems_);
+        LOG_WARN("Generate RTCP packet is too large %lli/%lli, reports should be circled, but not implemented!", 
+            compound_packet_size, mtu_size_);
     }
 
     uint8_t* frame = new uint8_t[compound_packet_size];
@@ -1473,12 +1582,10 @@ rtp_error_t uvgrtp::rtcp::generate_report()
     // see https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1
 
     int write_ptr = 0;
-    if (our_role_ == SENDER && our_stats.sent_rtp_packet)
+    if (sr_packet)
     {
         // sender reports have sender information in addition compared to receiver reports
         size_t sender_report_size = get_sr_packet_size(flags_, reports);
-
-        LOG_DEBUG("Generating RTCP Sender report size: %li", sender_report_size);
 
         /* TODO: The clock would be better to start with first sent RTP packet.
          * In reality it should be provided by user which I think is implemented? */
@@ -1493,21 +1600,30 @@ rtp_error_t uvgrtp::rtcp::generate_report()
         uint64_t rtp_ts = rtp_ts_start_ + (uvgrtp::clock::ntp::diff(clock_start_, ntp_ts))
             * float(clock_rate_ / 1000);
 
-
-        // TODO: Return error if these fail
-        construct_rtcp_header(frame, write_ptr, sender_report_size, reports, uvgrtp::frame::RTCP_FT_SR);
-        construct_ssrc(frame, write_ptr, ssrc_);
-        construct_sender_info(frame, write_ptr, ntp_ts, rtp_ts, our_stats.sent_pkts, our_stats.sent_bytes);
+        if (!construct_rtcp_header(frame, write_ptr, sender_report_size, reports, uvgrtp::frame::RTCP_FT_SR) ||
+            !construct_ssrc(frame, write_ptr, ssrc_) ||
+            !construct_sender_info(frame, write_ptr, ntp_ts, rtp_ts, our_stats.sent_pkts, our_stats.sent_bytes))
+        {
+            LOG_ERROR("Failed to construct SR");
+            return RTP_GENERIC_ERROR;
+        }
 
         our_stats.sent_rtp_packet = false;
 
-    } else { // RECEIVER
+    } else if (rr_packet) { // RECEIVER
         size_t receiver_report_size = get_rr_packet_size(flags_, reports);
-        LOG_DEBUG("Generating RTCP Receiver report size: %li", receiver_report_size);
 
-        // TODO: Return error if these fail
-        construct_rtcp_header(frame, write_ptr, receiver_report_size, reports, uvgrtp::frame::RTCP_FT_RR);
-        construct_ssrc(frame, write_ptr, ssrc_);
+        if (!construct_rtcp_header(frame, write_ptr, receiver_report_size, reports, uvgrtp::frame::RTCP_FT_RR) ||
+            !construct_ssrc(frame, write_ptr, ssrc_))
+        {
+            LOG_ERROR("Failed to construct RR");
+            return RTP_GENERIC_ERROR;
+        }
+    }
+    else
+    {
+        // SR or RR is mandatory at the beginning
+        return RTP_GENERIC_ERROR;
     }
 
     // the report blocks for sender or receiver report. Both have same reports.
@@ -1539,9 +1655,9 @@ rtp_error_t uvgrtp::rtcp::generate_report()
         }
     }
 
-    if (add_sdes)
+    if (sdes_packet)
     {
-        // add the SDES packet after the SR/RR
+        // add the SDES packet after the SR/RR, mandatory, must contain CNAME
         if (!construct_rtcp_header(frame, write_ptr, get_sdes_packet_size(ourItems_), num_receivers_,
             uvgrtp::frame::RTCP_FT_SDES) ||
             !construct_sdes_chunk(frame, write_ptr, { ssrc_, ourItems_ }))
@@ -1550,10 +1666,59 @@ rtp_error_t uvgrtp::rtcp::generate_report()
             delete[] frame;
             return RTP_GENERIC_ERROR;
         }
-
-        LOG_DEBUG("Sending RTCP report compound packet, Total size: %lli, SDES packet size: %lli",
-            compound_packet_size, get_sdes_packet_size(ourItems_));
     }
+
+    if (app_packets_size != 0)
+    {
+        for (auto& app_name : app_packets_)
+        {
+            // we send one packet per APP name
+
+            // TODO: Should we also send one per subtype?
+            if (!app_name.second.empty())
+            {
+                // take the oldest APP packet and send it
+                rtcp_app_packet next_packet = app_name.second.front();
+                app_name.second.pop_front();
+
+                uint16_t secondField = (next_packet.subtype & 0x1f);
+
+                size_t packet_size = get_app_packet_size(next_packet.payload_len);
+
+                if (!construct_rtcp_header(frame, write_ptr, packet_size, secondField,
+                    uvgrtp::frame::RTCP_FT_APP) ||
+                    !construct_ssrc(frame, write_ptr, ssrc_) ||
+                    !construct_app_packet(frame, write_ptr, next_packet.name, next_packet.payload, next_packet.payload_len))
+                {
+                    LOG_ERROR("Failed to construct APP packet");
+                    delete[] frame;
+                    return RTP_GENERIC_ERROR;
+                }
+            }
+        }
+    }
+
+    // BYE is last if it is sent
+    if (bye_packet)
+    {
+        // header construction does not add our ssrc for BYE
+        uint16_t secondField = (bye_ssrcs_.size() & 0x1f);
+        if (!construct_rtcp_header(frame, write_ptr, get_bye_packet_size(bye_ssrcs_), secondField,
+            uvgrtp::frame::RTCP_FT_BYE) ||
+            !construct_bye_packet(frame, write_ptr, bye_ssrcs_))
+        {
+            bye_ssrcs_.clear();
+            LOG_ERROR("Failed to construct BYE");
+            delete[] frame;
+            return RTP_GENERIC_ERROR;
+        }
+
+        bye_ssrcs_.clear();
+    }
+    
+
+    LOG_DEBUG("Sending RTCP report compound packet, Total size: %lli",
+        compound_packet_size);
 
     return send_rtcp_packet_to_participants(frame, compound_packet_size, true);
 }
@@ -1566,26 +1731,11 @@ rtp_error_t uvgrtp::rtcp::send_sdes_packet(const std::vector<uvgrtp::frame::rtcp
         return RTP_INVALID_VALUE;
     }
 
-    /* TODO: the SDES should be sent later in a compound packets, this saves it, but until the padding has
-     * been implemented, the sending cannot be implemented. */
-    set_sdes_items(items);
+    packet_mutex_.lock();
+    rtp_error_t ret = set_sdes_items(items);
+    packet_mutex_.unlock();
 
-    size_t rtcp_packet_size = get_sdes_packet_size(items);
-    uint8_t* frame = new uint8_t[rtcp_packet_size];
-    memset(frame, 0, rtcp_packet_size);
-
-    int write_ptr = 0;
-
-    if (!construct_rtcp_header(frame, write_ptr, rtcp_packet_size, 1, 
-                               uvgrtp::frame::RTCP_FT_SDES) ||
-        !construct_sdes_chunk(frame, write_ptr, { ssrc_, ourItems_ }))
-    {
-        delete[] frame;
-        return RTP_GENERIC_ERROR;
-    }
-
-    // TODO: Should only be sent in compound packet
-    return send_rtcp_packet_to_participants(frame, rtcp_packet_size, true);
+    return ret;
 }
 
 rtp_error_t uvgrtp::rtcp::send_bye_packet(std::vector<uint32_t> ssrcs)
@@ -1593,54 +1743,45 @@ rtp_error_t uvgrtp::rtcp::send_bye_packet(std::vector<uint32_t> ssrcs)
     // ssrcs contains all our ssrcs which we usually have one unless we are a mixer
     if (ssrcs.empty())
     {
-        LOG_WARN("Source Count in RTCP BYE packet is 0");
+        LOG_WARN("Source Count in RTCP BYE packet is 0. Not sending.");
     }
+    packet_mutex_.lock();
+    bye_ssrcs_ = ssrcs;
+    packet_mutex_.unlock();
 
-    size_t rtcp_packet_size = get_bye_packet_size(ssrcs);
-    uint8_t* frame = new uint8_t[rtcp_packet_size];
-    memset(frame, 0, rtcp_packet_size);
-
-    rtp_error_t ret = RTP_OK;
-    int write_ptr = 0;
-    uint16_t secondField = (ssrcs.size() & 0x1f);
-    // header construction does not add our ssrc for BYE
-    if (!construct_rtcp_header(frame, write_ptr, rtcp_packet_size, secondField, 
-                               uvgrtp::frame::RTCP_FT_BYE) ||
-        !construct_bye_packet(frame, write_ptr, ssrcs))
-    {
-        delete[] frame;
-        return RTP_GENERIC_ERROR;
-    }
-
-    // TODO: Should only be sent in a compound packet
-    return send_rtcp_packet_to_participants(frame, rtcp_packet_size, false);
+    return RTP_OK;
 }
 
 rtp_error_t uvgrtp::rtcp::send_app_packet(const char* name, uint8_t subtype,
     size_t payload_len, const uint8_t* payload)
 {
-    size_t rtcp_packet_size = get_app_packet_size(payload_len);
-    uint8_t* frame = new uint8_t[rtcp_packet_size];
-    memset(frame, 0, rtcp_packet_size);
-
-    int write_ptr = 0;
-    uint16_t secondField = (subtype & 0x1f);
-
-    if (!construct_rtcp_header(frame, write_ptr, rtcp_packet_size, secondField, 
-                               uvgrtp::frame::RTCP_FT_APP) ||
-        !construct_ssrc(frame, write_ptr, ssrc_) ||
-        !construct_app_packet(frame, write_ptr, name, payload, payload_len))
+    std::string str(name);
+    rtcp_app_packet packet = { name, subtype, payload_len, payload };
+    packet_mutex_.lock();
+    if (!app_packets_[name].empty())
     {
-        delete[] frame;
-        return RTP_GENERIC_ERROR;
+        LOG_WARN("Adding a new APP packet for sending when %llu packets are waiting to be sent",
+            app_packets_[name].size());
     }
+    app_packets_[name].push_back(packet);
+    packet_mutex_.unlock();
 
-    // TODO: Should only be sent in compound packet
-    return send_rtcp_packet_to_participants(frame, rtcp_packet_size, true);
+    return RTP_OK;
 }
 
 void uvgrtp::rtcp::set_session_bandwidth(int kbps)
 {
-    // Set this to one second until this is properly implemented
-    interval_ms_ = 60;
+    interval_ms_ = 1000*360 / kbps; // the reduced minimum (see section 6.2 in RFC 3550)
+
+    if (interval_ms_ > DEFAULT_RTCP_INTERVAL_MS)
+    {
+        interval_ms_ = DEFAULT_RTCP_INTERVAL_MS;
+    }
+    // TODO: This should follow the algorithm specified in RFC 3550 appendix-A.7
+}
+
+
+void uvgrtp::rtcp::set_mtu_size(size_t mtu_size)
+{
+    mtu_size_ = mtu_size;
 }

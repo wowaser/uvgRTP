@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <deque>
 
 namespace uvgrtp {
 
@@ -72,6 +73,15 @@ namespace uvgrtp {
         uvgrtp::frame::rtcp_sdes_packet     *sdes_frame = nullptr;
         uvgrtp::frame::rtcp_app_packet      *app_frame = nullptr;
     };
+
+    struct rtcp_app_packet {
+        const char* name;
+        uint8_t subtype;
+
+        size_t payload_len;
+        const uint8_t* payload;
+    };
+
     /// \endcond
 
     class rtcp {
@@ -288,9 +298,17 @@ namespace uvgrtp {
             // the length field is the rtcp packet size measured in 32-bit words - 1
             size_t rtcp_length_in_bytes(uint16_t length);
 
+            /// \cond DO_NOT_DOCUMENT
+            void set_mtu_size(size_t mtu_size);
+
         private:
 
             rtp_error_t set_sdes_items(const std::vector<uvgrtp::frame::rtcp_sdes_item>& items);
+
+            size_t size_of_ready_app_packets() const;
+
+            size_t size_of_compound_packet(uint16_t reports, 
+                bool sr_packet, bool rr_packet, bool sdes_packet, size_t app_size, bool bye_packet) const;
 
             /* read the header values from rtcp packet */
             void read_rtcp_header(const uint8_t* buffer, size_t& read_ptr, 
@@ -472,10 +490,17 @@ namespace uvgrtp {
 
             int interval_ms_;
 
-            std::vector<uvgrtp::frame::rtcp_sdes_item> ourItems_;
+            std::mutex packet_mutex_;
+
+            // messages waiting to be sent
+            std::vector<uvgrtp::frame::rtcp_sdes_item> ourItems_; // always sent
+            std::vector<uint32_t> bye_ssrcs_; // sent once
+            std::map<std::string, std::deque<rtcp_app_packet>> app_packets_; // sent one at a time per name
 
             uvgrtp::frame::rtcp_sdes_item cnameItem_;
             char cname_[255];
+
+            size_t mtu_size_;
     };
 }
 
