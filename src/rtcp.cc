@@ -1767,6 +1767,11 @@ rtp_error_t uvgrtp::rtcp::send_app_packet(const char* name, uint8_t subtype,
     return RTP_OK;
 }
 
+int uvgrtp::rtcp::get_rtcp_interval()
+{
+    return interval_ms_;
+}
+
 void uvgrtp::rtcp::set_session_bandwidth(int kbps)
 {
     interval_ms_ = 1000*360 / kbps; // the reduced minimum (see section 6.2 in RFC 3550)
