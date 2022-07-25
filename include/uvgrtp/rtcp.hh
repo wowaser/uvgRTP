@@ -203,6 +203,9 @@ namespace uvgrtp {
             /* Update various session statistics */
             void update_session_statistics(const uvgrtp::frame::rtp_frame *frame);
 
+            /* Getter for interval_ms_, which is calculated by set_session_bandwidth */
+            int get_rtcp_interval();
+
             void set_session_bandwidth(int kbps);
 
             /* Return SSRCs of all participants */
